@@ -3,6 +3,7 @@ import numpy as np
 import time
 import torch
 import torchvision
+from torchvision import transforms
 import pytorch_lightning as pl
 
 from packaging import version
@@ -16,7 +17,9 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+import wandb
 
+sys.path.append('taming-transformers')
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
 
@@ -68,6 +71,11 @@ def get_parser(**parser_kwargs):
         default=False,
         nargs="?",
         help="train",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        help="the directory with train.txt and val.txt"
     )
     parser.add_argument(
         "--no-test",
@@ -414,6 +422,66 @@ class CUDACallback(Callback):
         except AttributeError:
             pass
 
+class CustomDataset(Dataset):
+    def __init__(self, train_paths, transform=None, target_transform=None):
+        with open(train_paths) as infile:
+            self.paths = [line.strip() for line in infile.readlines() if line.strip()]
+        self.transform = transform
+        self.target_transform = target_transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img_path = self.paths[idx]
+        image = Image.open(img_path)
+        if self.transform:
+            image = self.transform(image)
+        return {"image": image, "text": 0} # Pretend this is a None
+
+    
+class ToMode:
+    def __init__(self, mode):
+        self.mode = mode
+        
+    def __call__(self, image):
+        return image.convert(self.mode)
+                                
+
+def tf(image):
+    size = 256
+    return transforms.Compose([
+        ToMode('RGB'),
+        transforms.Resize(size, interpolation=transforms.InterpolationMode.LANCZOS),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ])(image)
+
+
+class CustomDataModule(pl.LightningDataModule):
+        def __init__(self, data_dir: str, batch_size: int = 6):
+            super().__init__()
+            self.data_dir = data_dir
+            self.batch_size = batch_size
+            
+        def setup(self, stage=None):         
+            self.data_train = CustomDataset(self.data_dir + "train.txt", transform=tf)
+            self.data_val = CustomDataset(self.data_dir + "test.txt", transform=tf)
+
+        def train_dataloader(self):
+            return DataLoader(self.data_train, batch_size=self.batch_size)
+
+        def val_dataloader(self):
+            return DataLoader(self.data_val, batch_size=self.batch_size)
+
+        def test_dataloader(self):
+            return DataLoader(self.data_test, batch_size=self.batch_size)
+
+        def teardown(self, stage=None):
+            # Used to clean-up when the run is finished
+            pass
+
 
 if __name__ == "__main__":
     # custom parser to specify config files, train, test and debug mode,
@@ -659,17 +727,10 @@ if __name__ == "__main__":
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
 
-        # data
-        data = instantiate_from_config(config.data)
-        # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
-        # calling these ourselves should not be necessary but it is.
-        # lightning still takes care of proper multiprocessing though
-        data.prepare_data()
-        data.setup()
-        print("#### Data #####")
-        for k in data.datasets:
-            print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
 
+        # data
+        data = CustomDataModule(opt.data_dir)
+        
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
